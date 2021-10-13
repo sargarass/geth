@@ -1,9 +1,9 @@
 use slog::Drain;
 use std::collections::{HashMap, VecDeque};
-use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TryRecvError};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use std::{str, thread};
+use tokio::sync::{broadcast, mpsc, mpsc::error::TryRecvError, Mutex};
 
 use prost::Message as PbMessage;
 use raft::storage::MemStorage;
@@ -12,7 +12,8 @@ use regex::Regex;
 
 use slog::{error, info, o};
 
-fn main() {
+#[tokio::main]
+async fn main() {
     let decorator = slog_term::TermDecorator::new().build();
     let drain = slog_term::FullFormat::new(decorator).build().fuse();
     let drain = slog_async::Async::new(drain)
@@ -27,13 +28,13 @@ fn main() {
     // messages from others, and uses the respective `Sender` to send messages to others.
     let (mut tx_vec, mut rx_vec) = (Vec::new(), Vec::new());
     for _ in 0..NUM_NODES {
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::channel(100);
         tx_vec.push(tx);
         rx_vec.push(rx);
     }
 
-    let (tx_stop, rx_stop) = mpsc::channel();
-    let rx_stop = Arc::new(Mutex::new(rx_stop));
+    let (tx_stop, rx_stop) = broadcast::channel(1);
+    drop(rx_stop);
 
     // A global pending proposals queue. New proposals will be pushed back into the queue, and
     // after it's committed by the raft cluster, it will be poped from the queue.
@@ -54,107 +55,117 @@ fn main() {
         // Tick the raft node per 100ms. So use an `Instant` to trace it.
         let mut t = Instant::now();
 
-        // Clone the stop receiver
-        let rx_stop_clone = Arc::clone(&rx_stop);
-        let logger = logger.clone();
         // Here we spawn the node on a new thread and keep a handle so we can join on them later.
-        let handle = thread::spawn(move || loop {
-            thread::sleep(Duration::from_millis(10));
-            loop {
-                // Step raft messages.
-                match node.my_mailbox.try_recv() {
-                    Ok(msg) => node.step(msg, &logger),
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => return,
+        let handle = tokio::spawn({
+            // Clone the stop receiver
+            let mut rx_stop_clone = tx_stop.subscribe();
+            let logger = logger.clone();
+            async move {
+                loop {
+                    thread::sleep(Duration::from_millis(10));
+                    loop {
+                        // Step raft messages.
+                        match node.my_mailbox.try_recv() {
+                            Ok(msg) => node.step(msg, &logger),
+                            Err(TryRecvError::Empty) => break,
+                            Err(TryRecvError::Disconnected) => return,
+                        }
+                    }
+
+                    let raft_group = match node.raft_group {
+                        Some(ref mut r) => r,
+                        // When Node::raft_group is `None` it means the node is not initialized.
+                        _ => continue,
+                    };
+
+                    if t.elapsed() >= Duration::from_millis(100) {
+                        // Tick the raft.
+                        raft_group.tick();
+                        t = Instant::now();
+                    }
+
+                    // Let the leader pick pending proposals from the global queue.
+                    if raft_group.raft.state == StateRole::Leader {
+                        // Handle new proposals.
+                        let mut proposals = proposals.lock().await;
+                        for p in proposals.iter_mut().skip_while(|p| p.proposed > 0) {
+                            propose(raft_group, p).await;
+                        }
+                    }
+
+                    // Handle readies from the raft.
+                    on_ready(
+                        raft_group,
+                        &mut node.kv_pairs,
+                        &node.mailboxes,
+                        &proposals,
+                        &logger,
+                    )
+                    .await;
+
+                    // Check control signals from
+                    if check_signals(&mut rx_stop_clone).await {
+                        return;
+                    };
                 }
             }
-
-            let raft_group = match node.raft_group {
-                Some(ref mut r) => r,
-                // When Node::raft_group is `None` it means the node is not initialized.
-                _ => continue,
-            };
-
-            if t.elapsed() >= Duration::from_millis(100) {
-                // Tick the raft.
-                raft_group.tick();
-                t = Instant::now();
-            }
-
-            // Let the leader pick pending proposals from the global queue.
-            if raft_group.raft.state == StateRole::Leader {
-                // Handle new proposals.
-                let mut proposals = proposals.lock().unwrap();
-                for p in proposals.iter_mut().skip_while(|p| p.proposed > 0) {
-                    propose(raft_group, p);
-                }
-            }
-
-            // Handle readies from the raft.
-            on_ready(
-                raft_group,
-                &mut node.kv_pairs,
-                &node.mailboxes,
-                &proposals,
-                &logger,
-            );
-
-            // Check control signals from
-            if check_signals(&rx_stop_clone) {
-                return;
-            };
         });
         handles.push(handle);
     }
 
     // Propose some conf changes so that followers can be initialized.
-    add_all_followers(proposals.as_ref());
+    add_all_followers(proposals.as_ref()).await;
 
     // Put 100 key-value pairs.
     info!(
         logger,
         "We get a 5 nodes Raft cluster now, now propose 100 proposals"
     );
-    (0..100u16)
-        .filter(|i| {
-            let (proposal, rx) = Proposal::normal(*i, "hello, world".to_owned());
-            proposals.lock().unwrap().push_back(proposal);
-            // After we got a response from `rx`, we can assume the put succeeded and following
-            // `get` operations can find the key-value pair.
-            rx.recv().unwrap()
-        })
-        .count();
+
+    for i in 0..100u16 {
+        let (proposal, mut rx) = Proposal::normal(i, "hello, world".to_owned());
+        proposals.lock().await.push_back(proposal);
+        // After we got a response from `rx`, we can assume the put succeeded and following
+        // `get` operations can find the key-value pair.
+        rx.recv().await.unwrap();
+    }
 
     info!(logger, "Propose 100 proposals success!");
 
     // Send terminate signals
+    info!(logger, "Terminate signals");
     for _ in 0..NUM_NODES {
-        tx_stop.send(Signal::Terminate).unwrap();
+        let _ = tx_stop.send(Signal::Terminate);
     }
 
     // Wait for the thread to finish
     for th in handles {
-        th.join().unwrap();
+        th.await.unwrap();
     }
+    info!(logger, "Shutdown");
 }
 
+#[derive(Clone)]
 enum Signal {
     Terminate,
 }
 
-fn check_signals(receiver: &Arc<Mutex<mpsc::Receiver<Signal>>>) -> bool {
-    match receiver.lock().unwrap().try_recv() {
+async fn check_signals(receiver: &mut broadcast::Receiver<Signal>) -> bool {
+    use broadcast::error::TryRecvError;
+
+    match receiver.try_recv() {
         Ok(Signal::Terminate) => true,
         Err(TryRecvError::Empty) => false,
-        Err(TryRecvError::Disconnected) => true,
+        Err(TryRecvError::Closed) => true,
+        Err(TryRecvError::Lagged(_)) => true,
     }
 }
 
 struct Node {
     // None if the raft is not initialized.
     raft_group: Option<RawNode<MemStorage>>,
-    my_mailbox: Receiver<Message>,
-    mailboxes: HashMap<u64, Sender<Message>>,
+    my_mailbox: mpsc::Receiver<Message>,
+    mailboxes: HashMap<u64, mpsc::Sender<Message>>,
     // Key-value pairs after applied. `MemStorage` only contains raft logs,
     // so we need an additional storage engine.
     kv_pairs: HashMap<u16, String>,
@@ -164,8 +175,8 @@ impl Node {
     // Create a raft leader only with itself in its configuration.
     fn create_raft_leader(
         id: u64,
-        my_mailbox: Receiver<Message>,
-        mailboxes: HashMap<u64, Sender<Message>>,
+        my_mailbox: mpsc::Receiver<Message>,
+        mailboxes: HashMap<u64, mpsc::Sender<Message>>,
         logger: &slog::Logger,
     ) -> Self {
         let mut cfg = example_config();
@@ -191,8 +202,8 @@ impl Node {
 
     // Create a raft follower.
     fn create_raft_follower(
-        my_mailbox: Receiver<Message>,
-        mailboxes: HashMap<u64, Sender<Message>>,
+        my_mailbox: mpsc::Receiver<Message>,
+        mailboxes: HashMap<u64, mpsc::Sender<Message>>,
     ) -> Self {
         Node {
             raft_group: None,
@@ -228,10 +239,61 @@ impl Node {
     }
 }
 
-fn on_ready(
+async fn handle_messages(
+    mailboxes: &HashMap<u64, mpsc::Sender<Message>>,
+    msgs: Vec<Message>,
+    logger: &slog::Logger,
+) {
+    for msg in msgs {
+        let to = msg.to;
+        if mailboxes[&to].send(msg).await.is_err() {
+            error!(
+                logger,
+                "send raft message to {} fail, let Raft retry it", to
+            );
+        }
+    }
+}
+
+async fn handle_committed_entries(
+    rn: &mut RawNode<MemStorage>,
+    kv_pairs: &mut HashMap<u16, String>,
+    store: &MemStorage,
+    proposals: &Mutex<VecDeque<Proposal>>,
+    committed_entries: Vec<Entry>,
+) {
+    for entry in committed_entries {
+        if entry.data.is_empty() {
+            // From new elected leaders.
+            continue;
+        }
+        if let EntryType::EntryConfChangeV2 = entry.get_entry_type() {
+            // For conf change messages, make them effective.
+            let change: ConfChangeV2 = PbMessage::decode(entry.get_data()).unwrap();
+            let cs = rn.apply_conf_change(&change).unwrap();
+            store.wl().set_conf_state(cs);
+        } else {
+            // For normal proposals, extract the key-value pair and then
+            // insert them into the kv engine.
+            let data = str::from_utf8(&entry.data).unwrap();
+            let reg = Regex::new("put ([0-9]+) (.+)").unwrap();
+            if let Some(caps) = reg.captures(data) {
+                kv_pairs.insert(caps[1].parse().unwrap(), caps[2].to_string());
+            }
+        }
+        if rn.raft.state == StateRole::Leader {
+            // The leader should response to the clients, tell them if their proposals
+            // succeeded or not.
+            let proposal = proposals.lock().await.pop_front().unwrap();
+            proposal.propose_success.send(true).await.unwrap();
+        }
+    }
+}
+
+async fn on_ready(
     raft_group: &mut RawNode<MemStorage>,
     kv_pairs: &mut HashMap<u16, String>,
-    mailboxes: &HashMap<u64, Sender<Message>>,
+    mailboxes: &HashMap<u64, mpsc::Sender<Message>>,
     proposals: &Mutex<VecDeque<Proposal>>,
     logger: &slog::Logger,
 ) {
@@ -243,21 +305,9 @@ fn on_ready(
     // Get the `Ready` with `RawNode::ready` interface.
     let mut ready = raft_group.ready();
 
-    let handle_messages = |msgs: Vec<Message>| {
-        for msg in msgs {
-            let to = msg.to;
-            if mailboxes[&to].send(msg).is_err() {
-                error!(
-                    logger,
-                    "send raft message to {} fail, let Raft retry it", to
-                );
-            }
-        }
-    };
-
     if !ready.messages().is_empty() {
         // Send out the messages come from the node.
-        handle_messages(ready.take_messages());
+        handle_messages(mailboxes, ready.take_messages(), logger).await;
     }
 
     // Apply the snapshot. It's necessary because in `RawNode::advance` we stabilize the snapshot.
@@ -272,37 +322,15 @@ fn on_ready(
         }
     }
 
-    let mut handle_committed_entries =
-        |rn: &mut RawNode<MemStorage>, committed_entries: Vec<Entry>| {
-            for entry in committed_entries {
-                if entry.data.is_empty() {
-                    // From new elected leaders.
-                    continue;
-                }
-                if let EntryType::EntryConfChangeV2 = entry.get_entry_type() {
-                    // For conf change messages, make them effective.
-                    let change: ConfChangeV2 = PbMessage::decode(entry.get_data()).unwrap();
-                    let cs = rn.apply_conf_change(&change).unwrap();
-                    store.wl().set_conf_state(cs);
-                } else {
-                    // For normal proposals, extract the key-value pair and then
-                    // insert them into the kv engine.
-                    let data = str::from_utf8(&entry.data).unwrap();
-                    let reg = Regex::new("put ([0-9]+) (.+)").unwrap();
-                    if let Some(caps) = reg.captures(data) {
-                        kv_pairs.insert(caps[1].parse().unwrap(), caps[2].to_string());
-                    }
-                }
-                if rn.raft.state == StateRole::Leader {
-                    // The leader should response to the clients, tell them if their proposals
-                    // succeeded or not.
-                    let proposal = proposals.lock().unwrap().pop_front().unwrap();
-                    proposal.propose_success.send(true).unwrap();
-                }
-            }
-        };
     // Apply all committed entries.
-    handle_committed_entries(raft_group, ready.take_committed_entries());
+    handle_committed_entries(
+        raft_group,
+        kv_pairs,
+        &store,
+        proposals,
+        ready.take_committed_entries(),
+    )
+    .await;
 
     // Persistent raft logs. It's necessary because in `RawNode::advance` we stabilize
     // raft logs to the latest position.
@@ -321,7 +349,7 @@ fn on_ready(
 
     if !ready.persisted_messages().is_empty() {
         // Send out the persisted messages come from the node.
-        handle_messages(ready.take_persisted_messages());
+        handle_messages(mailboxes, ready.take_persisted_messages(), logger).await;
     }
 
     // Call `RawNode::advance` interface to update position flags in the raft.
@@ -331,9 +359,16 @@ fn on_ready(
         store.wl().mut_hard_state().set_commit(commit);
     }
     // Send out the messages.
-    handle_messages(light_rd.take_messages());
+    handle_messages(mailboxes, light_rd.take_messages(), logger).await;
     // Apply all committed entries.
-    handle_committed_entries(raft_group, light_rd.take_committed_entries());
+    handle_committed_entries(
+        raft_group,
+        kv_pairs,
+        &store,
+        proposals,
+        light_rd.take_committed_entries(),
+    )
+    .await;
     // Advance the apply index.
     raft_group.advance_apply();
 }
@@ -360,12 +395,12 @@ struct Proposal {
     transfer_leader: Option<u64>,
     // If it's proposed, it will be set to the index of the entry.
     proposed: u64,
-    propose_success: SyncSender<bool>,
+    propose_success: mpsc::Sender<bool>,
 }
 
 impl Proposal {
-    fn conf_change(cc: &ConfChangeV2) -> (Self, Receiver<bool>) {
-        let (tx, rx) = mpsc::sync_channel(1);
+    fn conf_change(cc: &ConfChangeV2) -> (Self, mpsc::Receiver<bool>) {
+        let (tx, rx) = mpsc::channel(1);
         let proposal = Proposal {
             normal: None,
             conf_change: Some(cc.clone()),
@@ -376,8 +411,8 @@ impl Proposal {
         (proposal, rx)
     }
 
-    fn normal(key: u16, value: String) -> (Self, Receiver<bool>) {
-        let (tx, rx) = mpsc::sync_channel(1);
+    fn normal(key: u16, value: String) -> (Self, mpsc::Receiver<bool>) {
+        let (tx, rx) = mpsc::channel(1);
         let proposal = Proposal {
             normal: Some((key, value)),
             conf_change: None,
@@ -389,7 +424,7 @@ impl Proposal {
     }
 }
 
-fn propose(raft_group: &mut RawNode<MemStorage>, proposal: &mut Proposal) {
+async fn propose(raft_group: &mut RawNode<MemStorage>, proposal: &mut Proposal) {
     let last_index1 = raft_group.raft.raft_log.last_index() + 1;
     if let Some((ref key, ref value)) = proposal.normal {
         let data = format!("put {} {}", key, value).into_bytes();
@@ -404,14 +439,14 @@ fn propose(raft_group: &mut RawNode<MemStorage>, proposal: &mut Proposal) {
     let last_index2 = raft_group.raft.raft_log.last_index() + 1;
     if last_index2 == last_index1 {
         // Propose failed, don't forget to respond to the client.
-        proposal.propose_success.send(false).unwrap();
+        proposal.propose_success.send(false).await.unwrap();
     } else {
         proposal.proposed = last_index1;
     }
 }
 
 // Proposes some conf change for peers [2, 5].
-fn add_all_followers(proposals: &Mutex<VecDeque<Proposal>>) {
+async fn add_all_followers(proposals: &Mutex<VecDeque<Proposal>>) {
     for i in 2..6u64 {
         let mut conf_change = ConfChangeV2::default();
         conf_change.mut_changes().push(ConfChangeSingle {
@@ -419,9 +454,9 @@ fn add_all_followers(proposals: &Mutex<VecDeque<Proposal>>) {
             node_id: i,
         });
         loop {
-            let (proposal, rx) = Proposal::conf_change(&conf_change);
-            proposals.lock().unwrap().push_back(proposal);
-            if rx.recv().unwrap() {
+            let (proposal, mut rx) = Proposal::conf_change(&conf_change);
+            proposals.lock().await.push_back(proposal);
+            if rx.recv().await.unwrap() {
                 break;
             }
             thread::sleep(Duration::from_millis(100));
